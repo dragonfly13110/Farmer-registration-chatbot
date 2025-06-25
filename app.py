@@ -4,10 +4,17 @@ import streamlit as st
 import os
 from dotenv import load_dotenv
 
-# --- ส่วนที่ต้องใช้จาก LangChain และ Google ---
+# --- ส่วนที่ต้องใช้จาก LangChain และ Google (ปรับปรุงใหม่) ---
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-import google.generativeai as genai
+
+# LangChain components for conversational memory and RAG
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, AIMessage # For converting Streamlit history to LangChain messages
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser # To parse the output from the LLM
 
 # --- โหลดค่าตั้งค่าและโมเดล ---
 load_dotenv()
@@ -46,23 +53,38 @@ def load_vector_store():
         st.error(f"เกิดข้อผิดพลาดในการโหลด Vector Store: {e}")
         return None
 
-def get_final_answer(question: str, context: str) -> str:
+# Store chat history outside the chain for Streamlit's session state
+# This is a simple in-memory store for a single user session.
+# For multi-user applications, this would need to be more sophisticated (e.g., database).
+store = {}
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+def create_rag_with_memory_chain():
     """
-    ใช้ Gemini สร้างคำตอบสุดท้ายด้วย Prompt ที่ฉลาดและมีความสามารถในการให้เหตุผล
+    สร้าง LangChain Runnable chain สำหรับ RAG พร้อมหน่วยความจำการสนทนา
     """
     if not api_key_pool:
-        return "เกิดข้อผิดพลาด: ไม่ได้ตั้งค่า Google API Key"
+        st.error("ไม่พบ Google API Key ใดๆ ในไฟล์ .env! ไม่สามารถสร้างโมเดลได้")
+        return None
 
     # สุ่มหยิบ Key มาใช้ในแต่ละครั้ง
-    import random
     selected_key = random.choice(api_key_pool)
-    genai.configure(api_key=selected_key)
-    
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-    # <<< Prompt ที่เป็นหัวใจของระบบเวอร์ชั่นนี้ >>>
-    prompt = f"""
-คุณคือ "ผู้เชี่ยวชาญให้คำปรึกษาด้านการขึ้นทะเบียนเกษตรกร" ที่มีความรู้จากคู่มืออย่างละเอียด และมีความสามารถในการให้เหตุผลเพื่อช่วยเหลือผู้ใช้
+    # ใช้ LangChain's ChatGoogleGenerativeAI
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash-latest",
+        temperature=0.7, # Adjust as needed
+        google_api_key=selected_key,
+    )
+
+    # Prompt Template สำหรับ Gemini
+    # เราจะให้ Gemini เห็นประวัติการสนทนาและข้อมูลอ้างอิง
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            ("system", """คุณคือ "ผู้เชี่ยวชาญให้คำปรึกษาด้านการขึ้นทะเบียนเกษตรกร" ที่มีความรู้จากคู่มืออย่างละเอียด และมีความสามารถในการให้เหตุผลเพื่อช่วยเหลือผู้ใช้
 
 **ภารกิจของคุณ:** ตอบคำถามของผู้ใช้ให้ถูกต้อง, เป็นประโยชน์, กระชับ, และอ่านง่ายที่สุด โดยมีขั้นตอนการคิดและตอบดังนี้:
 
@@ -82,7 +104,7 @@ def get_final_answer(question: str, context: str) -> str:
   - **หัวข้อ/Bullet Points:** หากเป็นการให้ข้อมูลหลายข้อ ให้ใช้หัวข้อสั้นๆ หรือ bullet points (เครื่องหมาย -) เพื่อแยกประเด็น
   - **อีโมจิ:** ใช้อีโมจิที่เกี่ยวข้อง 1-2 ตัวต่อหนึ่งคำตอบ เพื่อให้ดูเป็นมิตร (เช่น ✅, ❌, 📋, 🌾, 💡) แต่อย่าใช้เยอะเกินไป
 
-- **แนวทางการตอบ:**
+ - **แนวทางการตอบ:**
   - **กรณีที่ 1 (พบข้อมูลตรงๆ):** สรุปข้อมูลที่พบมาตอบโดยตรง พร้อมจัดรูปแบบให้อ่านง่าย
   - **กรณีที่ 2 (พบข้อมูลใกล้เคียง):** นำข้อมูลที่พบมาตอบ แล้วอาจจะเสริมว่า "ซึ่งเกณฑ์นี้ใช้กับไม้ผลโดยทั่วไป รวมถึงเงาะด้วยครับ"
   - **กรณีที่ 3 (ไม่พบข้อมูลโดยตรง แต่มีข้อมูลเกี่ยวข้อง):** เริ่มต้นว่า "ต้องขออภัยครับ 😥 จากการตรวจสอบ ไม่พบข้อมูลสำหรับกรณีของคุณโดยเฉพาะ แต่มีหลักเกณฑ์ทั่วไปที่เกี่ยวข้องดังนี้ครับ:" จากนั้นให้ข้อมูลนั้นในรูปแบบ bullet points
@@ -94,17 +116,23 @@ def get_final_answer(question: str, context: str) -> str:
 **ข้อมูลอ้างอิง:**
 {context}
 ---
+"""),
+            MessagesPlaceholder(variable_name="chat_history"), # This is where previous messages go
+            ("human", "{question}")
+        ]
+    )
 
-**คำถามของผู้ใช้:** {question}
+    # Combine prompt, LLM, and output parser
+    chain = prompt_template | llm | StrOutputParser()
 
-**คำตอบจากผู้เชี่ยวชาญ (จัดรูปแบบให้อ่านง่าย):**
-"""
-
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"ขออภัยครับ เกิดข้อผิดพลาดในการเชื่อมต่อกับ Gemini API: {e}"
+    # Add message history to the chain
+    conversational_rag_chain = RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="question",
+        history_messages_key="chat_history",
+    )
+    return conversational_rag_chain
 
 # --- ส่วนของหน้าเว็บ (Streamlit UI) ---
 st.set_page_config(page_title="เกษตรกรแชตบอท", page_icon="👩‍🌾")
@@ -122,21 +150,31 @@ for message in st.session_state.messages:
 
 # --- Main Logic ---
 if db:
+    # Create the RAG chain with memory once
+    rag_chain_with_memory = create_rag_with_memory_chain()
+
     if user_question := st.chat_input("พิมพ์คำถามของคุณที่นี่..."):
         st.session_state.messages.append({"role": "user", "content": user_question})
         with st.chat_message("user"):
             st.markdown(user_question)
 
         with st.spinner("กำลังค้นหาข้อมูลและสร้างคำตอบ..."):
-            
+
             # "หว่านแห" โดยดึงเอกสารมา 7 ชิ้น (เป็นค่าที่สมดุล)
             retrieved_docs = db.similarity_search(user_question, k=7)
-            
+
             context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
-            
-            # เรียกใช้ฟังก์ชันสร้างคำตอบสุดท้าย (เรียก API แค่ครั้งเดียว)
-            final_answer = get_final_answer(user_question, context)
-            
+
+            # Invoke the chain with the current question and context
+            try:
+                final_answer = rag_chain_with_memory.invoke(
+                    {"question": user_question, "context": context},
+                    config={"configurable": {"session_id": "streamlit_chat_session"}}, # Use a fixed session ID for this single-user app
+                )
+            except Exception as e:
+                final_answer = f"ขออภัยครับ เกิดข้อผิดพลาดในการเชื่อมต่อกับ Gemini API หรือการประมวลผล: {e}"
+                st.error(final_answer) # Display error in Streamlit
+
             st.session_state.messages.append({"role": "assistant", "content": final_answer})
             with st.chat_message("assistant"):
                 st.markdown(final_answer)

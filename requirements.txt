@@ -1,0 +1,12 @@
+streamlit
+langchain
+langchain-community
+faiss-cpu
+sentence-transformers
+python-dotenv
+requests
+pypdf
+cryptography  # << เพิ่มบรรทัดนี้เข้าไป
+python-docx
+docx2txt
+google-generativeai

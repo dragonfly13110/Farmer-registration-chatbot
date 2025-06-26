@@ -11,3 +11,4 @@ cryptography  # << เพิ่มบรรทัดนี้เข้าไป
 python-docx
 docx2txt
 google-generativeai
+langchain-google-genai

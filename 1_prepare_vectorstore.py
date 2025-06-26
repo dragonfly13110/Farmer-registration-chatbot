@@ -1,104 +1,162 @@
-# 1_prepare_vectorstore.py (ฉบับสมบูรณ์สำหรับ 2 ไฟล์: FAQ + Knowledge Base)
-
 import os
 import re
 import shutil
 
-# --- ส่วนที่ต้องใช้จาก LangChain ---
 from langchain_community.document_loaders import Docx2txtLoader
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 
-# --- ตั้งค่า ---
-# ตรวจสอบให้แน่ใจว่าไฟล์ Word ทั้งสองไฟล์อยู่ในโฟลเดอร์ data และชื่อตรงกัน
-FAQ_DOCX_PATH = "data/farmer_guide.docx"  # ไฟล์ Q&A 100+ ข้อ
-KB_DOCX_PATH = "data/knowledge_base.docx" # ไฟล์สรุปเนื้อหา 10 ช่วง
-VECTORSTORE_PATH = "vectorstore_combined" # ชื่อของ Vector Store ที่จะถูกสร้าง
-# เรายังคงใช้ Embedding Model ที่ดีที่สุดสำหรับภาษาไทย
+# --- การตั้งค่า ---
+KB_DOCX_PATH = "data/knowledge_base.docx" # ไฟล์ฐานความรู้ฉบับละเอียดที่คุณเรียบเรียง
+VECTORSTORE_PATH = "vectorstore_smart_chunking" # ชื่อ Vector Store ใหม่
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 
-def create_qa_chunks(text: str) -> list[str]:
+# --- ฟังก์ชัน Chunking แบบต่างๆ ---
+
+def chunk_by_headers(text: str) -> list[Document]:
     """
-    ฟังก์ชันพิเศษสำหรับตัดแบ่งข้อความตามรูปแบบ Q&A (เช่น "1. ถาม:")
-    ใช้ Regular Expression เพื่อหาและตัดข้อความที่ขึ้นต้นด้วย "ตัวเลข. ถาม:"
+    กลยุทธ์ที่ 1: ตัดแบ่งตามหัวข้อ Markdown (เหมาะกับเนื้อหาบรรยาย, กฎเกณฑ์)
+    ใช้ #, ##, ### เป็นตัวแบ่ง จะทำให้เนื้อหาที่อยู่ใต้หัวข้อเดียวกันไม่แยกจากกัน
     """
-    # Pattern นี้จะมองหา "ตัวเลข. ถาม:" และจับคู่ข้อความทั้งหมดไปจนถึงก่อน "ตัวเลข. ถาม:" อันถัดไป หรือจนจบไฟล์
-    pattern = re.compile(r"(\d{1,3}\.\s*ถาม:.*?(?=\n\d{1,3}\.\s*ถาม:|\Z))", re.DOTALL)
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+        ("####", "Header 4"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=headers_to_split_on,
+        strip_headers=False # คงหัวข้อไว้ในเนื้อหาเพื่อเป็น context
+    )
+    docs = markdown_splitter.split_text(text)
+    # เพิ่มการซอยย่อยสำหรับส่วนที่ยาวเกินไป
+    final_docs = []
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+    for doc in docs:
+        if len(doc.page_content) > 800:
+            sub_docs = text_splitter.create_documents([doc.page_content], metadatas=[doc.metadata])
+            final_docs.extend(sub_docs)
+        else:
+            final_docs.append(doc)
+    return final_docs
+
+def chunk_definitions(text: str) -> list[Document]:
+    """
+    กลยุทธ์ที่ 2: ตัดแบ่งนิยามศัพท์ (แต่ละนิยามคือ 1 chunk)
+    ใช้ Regular Expression เพื่อหาหัวข้อที่มีตัวเลขนำหน้า (เช่น "1. เกษตรกร")
+    """
+    # มองหา Pattern "#### ตัวเลข. ชื่อเรื่อง" และจับคู่ข้อความทั้งหมดจนถึงหัวข้อถัดไป
+    pattern = re.compile(r"(####\s*\d+\..*?(?=\n####\s*\d+\.|\Z))", re.DOTALL)
+    definitions = pattern.findall(text)
     
-    qa_pairs = pattern.findall(text)
-    
-    # ทำความสะอาดข้อความแต่ละชิ้น ตัดช่องว่างที่ไม่จำเป็นออก
-    cleaned_pairs = [pair.strip() for pair in qa_pairs if pair.strip()]
-    
-    return cleaned_pairs
+    # ทำความสะอาดและสร้างเป็น Document
+    docs = [Document(page_content=d.strip()) for d in definitions if d.strip()]
+    return docs
+
+def chunk_table_like_data(text: str, chunk_prefix: str) -> list[Document]:
+    """
+    กลยุทธ์ที่ 3: ตัดแบ่งข้อมูลแบบตาราง (แต่ละแถว/รายการ คือ 1 chunk)
+    ใช้การ split by newline และเติม Prefix เพื่อให้ context ชัดเจน
+    """
+    # ลบหัวข้อหลักออกก่อน
+    lines = text.strip().split('\n')
+    header = lines[0] # เก็บหัวข้อหลักไว้
+    items = [line.strip() for line in lines[2:] if line.strip().startswith('*')] # เอาเฉพาะบรรทัดที่เป็นรายการ
+
+    docs = []
+    for item in items:
+        # สร้างเนื้อหา chunk โดยรวมหัวข้อหลักและรายการย่อย
+        # นำเครื่องหมาย * และตัวหนาออก
+        clean_item = item.replace('*', '').replace('**', '').strip()
+        page_content = f"{chunk_prefix}: {clean_item}"
+        docs.append(Document(page_content=page_content))
+    return docs
 
 def main():
-    """
-    ฟังก์ชันหลักในการสร้าง Vector Store
-    """
-    print("🚀 เริ่มต้นสร้าง Vector Store แบบผสม (Combined)...")
-    all_documents = []
-
-    # --- ส่วนที่ 1: ประมวลผลไฟล์ FAQ (Q&A) ---
-    if os.path.exists(FAQ_DOCX_PATH):
-        print(f"กำลังประมวลผลไฟล์ FAQ: {FAQ_DOCX_PATH}")
-        try:
-            faq_loader = Docx2txtLoader(FAQ_DOCX_PATH)
-            faq_text = faq_loader.load()[0].page_content
-            faq_chunks = create_qa_chunks(faq_text)
-            
-            # ใส่ Metadata บอกว่ามาจากไฟล์ FAQ
-            faq_docs = [Document(page_content=chunk, metadata={"source": "faq"}) for chunk in faq_chunks]
-            all_documents.extend(faq_docs)
-            print(f"✅ ประมวลผล FAQ สำเร็จ, พบ {len(faq_docs)} คู่ Q&A")
-        except Exception as e:
-            print(f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์ FAQ: {e}")
-    else:
-        print(f"⚠️ ไม่พบไฟล์ FAQ ที่: {FAQ_DOCX_PATH}")
-
-    # --- ส่วนที่ 2: ประมวลผลไฟล์ Knowledge Base (เนื้อหาบรรยาย) ---
-    if os.path.exists(KB_DOCX_PATH):
-        print(f"กำลังประมวลผลไฟล์ Knowledge Base: {KB_DOCX_PATH}")
-        try:
-            kb_loader = Docx2txtLoader(KB_DOCX_PATH)
-            kb_documents = kb_loader.load()
-            # ใช้การตัดแบ่งแบบ Recursive สำหรับเนื้อหาบรรยาย
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=150)
-            kb_chunks = text_splitter.split_documents(kb_documents)
-            
-            # ใส่ Metadata บอกว่ามาจากไฟล์ KB
-            for chunk in kb_chunks:
-                chunk.metadata["source"] = "knowledge_base"
-            all_documents.extend(kb_chunks)
-            print(f"✅ ประมวลผล Knowledge Base สำเร็จ, แบ่งได้ {len(kb_chunks)} chunks")
-        except Exception as e:
-            print(f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์ Knowledge Base: {e}")
-    else:
-        print(f"⚠️ ไม่พบไฟล์ Knowledge Base ที่: {KB_DOCX_PATH}")
-
-    # --- ส่วนที่ 3: สร้าง Vector Store ---
-    if not all_documents:
-        print("❌ ไม่พบข้อมูลจากไฟล์ใดๆ เลย! หยุดการทำงาน")
+    print("🚀 เริ่มต้นสร้าง Vector Store แบบ Smart Chunking...")
+    
+    if not os.path.exists(KB_DOCX_PATH):
+        print(f"❌ ไม่พบไฟล์ฐานข้อมูลที่: {KB_DOCX_PATH}")
         return
 
+    # --- 1. โหลดและแยกส่วนเนื้อหาตามตัวคั่นพิเศษ ---
+    print(f"กำลังโหลดและแยกส่วนเนื้อหาจาก: {KB_DOCX_PATH}")
+    loader = Docx2txtLoader(KB_DOCX_PATH)
+    full_text = loader.load()[0].page_content
+    
+    # ใช้ Regex เพื่อแยกส่วนตาม ---[SECTION:NAME]---
+    # (?s) คือ re.DOTALL, (.*?) คือ non-greedy match
+    sections = re.findall(r"---SECTION:(.*?)---\n(?s)(.*?)(?=---SECTION:|$)", full_text)
+    section_map = {name.strip(): content.strip() for name, content in sections}
+    
+    if not section_map:
+        print("⚠️ ไม่พบตัวคั่น '---[SECTION:...]--' ในไฟล์! จะใช้การตัดแบ่งแบบ Recursive ทั้งหมดแทน")
+        # Fallback to simple recursive splitter if no sections found
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+        all_documents = text_splitter.create_documents([full_text])
+    else:
+        # --- 2. ใช้กลยุทธ์ Chunking ที่ต่างกันในแต่ละส่วน ---
+        print("พบเนื้อหา {len(section_map)} ส่วน! กำลังใช้กลยุทธ์ตัดแบ่งที่แตกต่างกัน...")
+        all_documents = []
+
+        if "DEFINITIONS" in section_map:
+            print("  - 📝 กำลังประมวลผล 'DEFINITIONS' แบบ chunk-per-definition...")
+            docs = chunk_definitions(section_map["DEFINITIONS"])
+            for doc in docs: doc.metadata["source"] = "definitions"
+            all_documents.extend(docs)
+            print(f"    -> สร้างได้ {len(docs)} chunks")
+
+        if "RULES" in section_map:
+            print("  - 📜 กำลังประมวลผล 'RULES' แบบ chunk-by-header...")
+            docs = chunk_by_headers(section_map["RULES"])
+            for doc in docs: doc.metadata["source"] = "rules_and_conditions"
+            all_documents.extend(docs)
+            print(f"    -> สร้างได้ {len(docs)} chunks")
+            
+        if "HOW_TO_GUIDE" in section_map:
+            print("  - 👣 กำลังประมวลผล 'HOW_TO_GUIDE' แบบ chunk-by-header...")
+            docs = chunk_by_headers(section_map["HOW_TO_GUIDE"])
+            for doc in docs: doc.metadata["source"] = "how_to_guide"
+            all_documents.extend(docs)
+            print(f"    -> สร้างได้ {len(docs)} chunks")
+            
+        if "TIMELINES" in section_map:
+            print("  - ⏰ กำลังประมวลผล 'TIMELINES' แบบ chunk-by-header...")
+            docs = chunk_by_headers(section_map["TIMELINES"])
+            for doc in docs: doc.metadata["source"] = "timelines"
+            all_documents.extend(docs)
+            print(f"    -> สร้างได้ {len(docs)} chunks")
+
+        if "PLANTING_DENSITY" in section_map:
+            print("  - 🌳 กำลังประมวลผล 'PLANTING_DENSITY' แบบ chunk-per-item...")
+            docs = chunk_table_like_data(
+                section_map["PLANTING_DENSITY"],
+                chunk_prefix="เกณฑ์จำนวนต้นต่อไร่"
+            )
+            for doc in docs: doc.metadata["source"] = "planting_density"
+            all_documents.extend(docs)
+            print(f"    -> สร้างได้ {len(docs)} chunks")
+
+    if not all_documents:
+        print("❌ ไม่สามารถสร้างเอกสารใดๆ ได้! หยุดการทำงาน")
+        return
+
+    # --- 3. สร้าง Vector Store ---
     print(f"\nกำลังสร้าง Vector Store จากเอกสารทั้งหมด {len(all_documents)} ชิ้น...")
     
-    # โหลด Embedding Model
     print(f"กำลังโหลด Embedding Model: {EMBEDDING_MODEL}")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={'device': 'cuda'}) # Use 'cpu' if no GPU
     
-    # ลบ Vector Store เก่าทิ้งก่อนเสมอ เพื่อให้แน่ใจว่าเป็นข้อมูลล่าสุด
     if os.path.exists(VECTORSTORE_PATH):
         print(f"กำลังลบ Vector Store เก่าที่ '{VECTORSTORE_PATH}'...")
         shutil.rmtree(VECTORSTORE_PATH)
-        print("✅ ลบสำเร็จ!")
 
-    # สร้าง Vector Store ใหม่จากเอกสารทั้งหมด
     db = FAISS.from_documents(all_documents, embeddings)
     db.save_local(VECTORSTORE_PATH)
-    print(f"✅ สร้าง Vector Store แบบผสมเสร็จสิ้น! บันทึกไว้ที่: {VECTORSTORE_PATH}")
+    print(f"✅ สร้าง Vector Store แบบ Smart Chunking เสร็จสิ้น! บันทึกไว้ที่: {VECTORSTORE_PATH}")
+
 
 if __name__ == "__main__":
     main()

@@ -12,6 +12,7 @@ from langchain_core.documents import Document
 # --- การตั้งค่าหลัก ---
 # ใช้ไฟล์ Markdown เป็นแหล่งข้อมูลหลัก
 KB_MARKDOWN_PATH = "data/knowledge_base.md"
+QNA_MARKDOWN_PATH = "data/Q&A.md" # เพิ่มไฟล์ Q&A.md
 # ตั้งชื่อ Vector Store ให้สื่อถึงวิธีการสร้าง
 VECTORSTORE_PATH = "vectorstore_smart_chunking_v2" 
 # Embedding Model ที่ดีที่สุดสำหรับภาษาไทย
@@ -80,6 +81,81 @@ def chunk_table_like_data(text: str, chunk_prefix: str) -> list[Document]:
         docs.append(Document(page_content=page_content))
     return docs
 
+def parse_qna_markdown(text: str) -> list[Document]:
+    """
+    กลยุทธ์เฉพาะ: ตัดแบ่ง Q&A จากไฟล์ Q&A.md
+    แต่ละคำถาม-คำตอบจะถูกรวมเป็น 1 chunk
+    """
+    qna_docs = []
+    lines = text.split('\n')
+    current_category = ""
+    current_subcategory = ""
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Extract main category (## หมวด)
+        if line.startswith('## หมวด'):
+            current_category = line.replace('## หมวด', '').strip()
+            current_subcategory = "" # Reset subcategory
+            i += 1
+            continue
+        # Extract subcategory (### หมวด)
+        elif line.startswith('### หมวด'):
+            current_subcategory = line.replace('### หมวด', '').strip()
+            i += 1
+            continue
+        
+        # Check for question pattern: 1.  **ถาม:** "..."
+        q_match = re.match(r'^\d+\.\s+\*\*ถาม:\*\*\s*(.*)$', line)
+        if q_match:
+            question_text = q_match.group(1).strip()
+            # Remove leading/trailing quotes if they exist
+            if question_text.startswith('"') and question_text.endswith('"'):
+                question_text = question_text[1:-1]
+            
+            # Look for answer in the next line(s)
+            answer_lines = []
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if next_line.startswith('> **ตอบ:**'):
+                    answer_lines.append(next_line.replace('> **ตอบ:**', '').strip())
+                    j += 1
+                    # Continue collecting blockquote lines if they are part of the same answer
+                    while j < len(lines) and lines[j].strip().startswith('>'):
+                        answer_lines.append(lines[j].strip().lstrip('>').strip())
+                        j += 1
+                    break # Found answer, break inner loop
+                elif next_line.strip() == '---' or re.match(r'^\d+\.\s+\*\*ถาม:\*\*', next_line) or next_line.startswith('## หมวด') or next_line.startswith('### หมวด'):
+                    break
+                else:
+                    j += 1
+            
+            answer = " ".join(answer_lines).strip()
+            
+            if question_text and answer:
+                full_content = f"หมวด: {current_category}"
+                if current_subcategory:
+                    full_content += f" / {current_subcategory}"
+                full_content += f"\nคำถาม: {question_text}\nคำตอบ: {answer}"
+                
+                metadata = {
+                    "source": "Q&A", 
+                    "category": current_category
+                }
+                if current_subcategory:
+                    metadata["subcategory"] = current_subcategory
+                
+                qna_docs.append(Document(page_content=full_content, metadata=metadata))
+            
+            i = j # Move index to after the answer
+        else:
+            i += 1 # Move to next line if not a question
+
+    return qna_docs
+
 def main():
     """ฟังก์ชันหลักในการสร้าง Vector Store"""
     print("🚀 เริ่มต้นสร้าง Vector Store แบบ Smart Chunking...")
@@ -87,46 +163,51 @@ def main():
     if not os.path.exists(KB_MARKDOWN_PATH):
         print(f"❌ ไม่พบไฟล์ฐานข้อมูลที่: {KB_MARKDOWN_PATH}")
         return
+    if not os.path.exists(QNA_MARKDOWN_PATH):
+        print(f"❌ ไม่พบไฟล์ Q&A ที่: {QNA_MARKDOWN_PATH}")
+        return
 
-    # --- 1. โหลดและแยกส่วนเนื้อหาจากไฟล์ .md ---
+    all_documents = []
+
+    # --- 1. โหลดและแยกส่วนเนื้อหาจาก knowledge_base.md ---
     print(f"กำลังโหลดและแยกส่วนเนื้อหาจาก: {KB_MARKDOWN_PATH}")
-    loader = TextLoader(KB_MARKDOWN_PATH, encoding="utf-8")
-    full_text = loader.load()[0].page_content
+    loader_kb = TextLoader(KB_MARKDOWN_PATH, encoding="utf-8")
+    full_text_kb = loader_kb.load()[0].page_content
     
     # ใช้ re.split เพื่อแยกส่วนตามตัวคั่น ---[SECTION:NAME]---
     section_delimiter_pattern = r'---\[SECTION:(.*?)\]---'
-    parts = re.split(section_delimiter_pattern, full_text)
+    parts_kb = re.split(section_delimiter_pattern, full_text_kb)
 
     # จัดการผลลัพธ์จาก re.split
     # ผลลัพธ์จะเป็น [เนื้อหาก่อนตัวคั่นแรก, ชื่อsection1, เนื้อหาsection1, ชื่อsection2, เนื้อหาsection2, ...]
-    if len(parts) > 1:
+    section_map_kb = {}
+    if len(parts_kb) > 1:
         # เราไม่เอาส่วนแรก (index 0) และจะจับคู่ ชื่อ กับ เนื้อหา
-        section_names = parts[1::2]      # เอา index 1, 3, 5, ...
-        section_contents = parts[2::2]   # เอา index 2, 4, 6, ...
-        section_map = {name.strip(): content.strip() for name, content in zip(section_names, section_contents)}
-    else:
-        section_map = {}
+        section_names_kb = parts_kb[1::2]
+        section_contents_kb = parts_kb[2::2]
+        section_map_kb = {name.strip(): content.strip() for name, content in zip(section_names_kb, section_contents_kb)}
 
-    if not section_map:
-        print("⚠️ ไม่พบตัวคั่น '---[SECTION:...]--' ในไฟล์! จะใช้การตัดแบ่งแบบ Recursive ทั้งหมดแทน")
+    if not section_map_kb:
+        print("⚠️ ไม่พบตัวคั่น '---[SECTION:...]--' ในไฟล์ knowledge_base.md! จะใช้การตัดแบ่งแบบ Recursive ทั้งหมดแทน")
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-        all_documents = text_splitter.create_documents([full_text])
+        kb_documents = text_splitter.create_documents([full_text_kb])
+        all_documents.extend(kb_documents)
     else:
         # --- 2. ใช้กลยุทธ์ Chunking ที่แตกต่างกันในแต่ละส่วน ---
-        print(f"พบเนื้อหา {len(section_map)} ส่วน! กำลังใช้กลยุทธ์ตัดแบ่งที่แตกต่างกัน...")
-        all_documents = []
+        print(f"พบเนื้อหา {len(section_map_kb)} ส่วนใน knowledge_base.md! กำลังใช้กลยุทธ์ตัดแบ่งที่แตกต่างกัน...")
         
         # สร้าง mapping ระหว่างชื่อ Section และฟังก์ชันที่ใช้
         strategy_map = {
-            "DEFINITIONS": ("📝 กำลังประมวลผล 'DEFINITIONS' แบบ chunk-per-definition...", chunk_definitions, {}),
-            "RULES": ("📜 กำลังประมวลผล 'RULES' แบบ chunk-by-header...", chunk_by_headers, {}),
-            "HOW_TO_GUIDE": ("👣 กำลังประมวลผล 'HOW_TO_GUIDE' แบบ chunk-by-header...", chunk_by_headers, {}),
-            "MAINTENANCE": ("⚙️ กำลังประมวลผล 'MAINTENANCE' แบบ chunk-by-header...", chunk_by_headers, {}),
-            "TIMELINES": ("⏰ กำลังประมวลผล 'TIMELINES' แบบ chunk-by-header...", chunk_by_headers, {}),
-            "PLANTING_DENSITY": ("🌳 กำลังประมวลผล 'PLANTING_DENSITY' แบบ chunk-per-item...", chunk_table_like_data, {"chunk_prefix": "เกณฑ์จำนวนต้นต่อไร่"})
+            "DEFINITIONS": ("📝 ...", chunk_definitions, {}),
+            "RULES": ("📜 ...", chunk_by_headers, {}),
+            "HOW_TO_GUIDE": ("👣 ...", chunk_by_headers, {}),
+            "MAINTENANCE": ("⚙️ ...", chunk_by_headers, {}),
+            "TIMELINES": ("⏰ ...", chunk_by_headers, {}),
+            "PLANTING_DENSITY": ("🌳 ...", chunk_table_like_data, {"chunk_prefix": "เกณฑ์จำนวนต้นต่อไร่"}),
+            "MINIMUM_AREA": ("📏 กำลังประมวลผล 'MINIMUM_AREA' แบบ chunk-by-header...", chunk_by_headers, {}) 
         }
 
-        for name, content in section_map.items():
+        for name, content in section_map_kb.items():
             if name in strategy_map:
                 message, chunk_func, kwargs = strategy_map[name]
                 print(f"  - {message}")
@@ -136,10 +217,19 @@ def main():
                 all_documents.extend(docs)
                 print(f"    -> สร้างได้ {len(docs)} chunks")
             else:
-                print(f"  - ❓ ไม่พบกลยุทธ์สำหรับ '{name}', จะใช้การตัดแบ่งแบบ Recursive แทน...")
+                print(f"  - ❓ ไม่พบกลยุทธ์สำหรับ '{name}' ใน knowledge_base.md, จะใช้การตัดแบ่งแบบ Recursive แทน...")
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
                 docs = text_splitter.create_documents([content])
                 all_documents.extend(docs)
+
+    # --- 2. โหลดและแยกส่วนเนื้อหาจาก Q&A.md ---
+    print(f"\nกำลังโหลดและแยกส่วนเนื้อหาจาก: {QNA_MARKDOWN_PATH}")
+    loader_qna = TextLoader(QNA_MARKDOWN_PATH, encoding="utf-8")
+    full_text_qna = loader_qna.load()[0].page_content
+    
+    qna_documents = parse_qna_markdown(full_text_qna)
+    all_documents.extend(qna_documents)
+    print(f"  -> สร้างได้ {len(qna_documents)} Q&A chunks")
 
 
     if not all_documents:

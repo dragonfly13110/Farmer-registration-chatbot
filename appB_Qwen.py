@@ -3,10 +3,10 @@ import os
 import random
 from dotenv import load_dotenv
 
-# --- ส่วนที่ต้องใช้จาก LangChain และ Google ---
+# --- [เปลี่ยน] ส่วนที่ต้องใช้จาก LangChain และ Together AI ---
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_together import ChatTogether  # [เปลี่ยน] จาก Google เป็น Together
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
@@ -15,18 +15,19 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain.schema import Document
 
-# --- โหลดค่าตั้งค่าและโมเดล ---
+# --- [เปลี่ยน] โหลดค่าตั้งค่าและโมเดล ---
 load_dotenv()
-api_keys = [key for key in os.environ.keys() if key.startswith("GOOGLE_API_KEY")]
-api_key_pool = [os.getenv(key) for key in api_keys if os.getenv(key)]
+# [เปลี่ยน] โหลด Together API Key แทน
+together_api_key = os.getenv("TOGETHER_API_KEY")
 
-if not api_key_pool:
-    st.error("ไม่พบ Google API Key ใดๆ ในไฟล์ .env! กรุณาตรวจสอบ")
+if not together_api_key:
+    st.error("ไม่พบ TOGETHER_API_KEY ในไฟล์ .env! กรุณาตรวจสอบ")
     st.stop()
 
 VECTORSTORE_PATH = "vectorstore_smart_chunking_v2" 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-LLM_MODEL = "gemini-2.5-flash" 
+# [เปลี่ยน] เปลี่ยนชื่อ LLM Model ตามที่ต้องการ
+LLM_MODEL = "Qwen/Qwen3-30B-A3B-Base" 
 
 # [เพิ่ม] กำหนดค่าคงที่สำหรับขนาดของ history เพื่อให้ง่ายต่อการปรับแก้
 MAX_HISTORY_MESSAGES = 6
@@ -48,7 +49,6 @@ def load_vector_store():
         return None
 
 store = {}
-# [แก้ไข] ปรับปรุงฟังก์ชันนี้เพื่อจำกัดขนาดของ history (Sliding Window)
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     """
     ดึงประวัติการแชตสำหรับ session ปัจจุบัน และจัดการขนาดของ history
@@ -57,11 +57,8 @@ def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     if session_id not in store:
         store[session_id] = InMemoryChatMessageHistory()
     
-    # ดึง history object ทั้งหมดออกมาจาก store
     session_history = store[session_id]
     
-    # ตรวจสอบขนาดของ history และตัดให้เหลือแค่ k ข้อความล่าสุด
-    # การทำแบบนี้จะแก้ไขที่ตัว object ใน store โดยตรง ทำให้ history ไม่สะสมยาวเกินไป
     if len(session_history.messages) > MAX_HISTORY_MESSAGES:
         session_history.messages = session_history.messages[-MAX_HISTORY_MESSAGES:]
         
@@ -81,11 +78,11 @@ def get_chains(_retriever):
     """สร้าง Chains ทั้งหมด (Rewriter + RAG)"""
     st.write("กำลังเตรียมผู้ช่วย AI...")
     
-    selected_key = random.choice(api_key_pool)
-    llm = ChatGoogleGenerativeAI(
+    # [เปลี่ยน] เรียกใช้ ChatTogether แทน
+    llm = ChatTogether(
         model=LLM_MODEL,
-        temperature=0.7, # ลด Temp ลงเพื่อความแม่นยำ
-        google_api_key=selected_key,
+        temperature=0.7, 
+        together_api_key=together_api_key,
     )
 
     # --- Chain 1: สำหรับแปลงคำถาม (Rewriter) ---
@@ -147,7 +144,7 @@ def get_chains(_retriever):
         ("human", "{question}")
     ])
 
-    # --- ประกอบร่าง RAG Chain ---
+    # --- ส่วนที่เหลือของ Chain ไม่ต้องแก้ไข ---
     rag_chain_with_source = RunnableParallel(
         standalone_question=rewriter_chain,
         original_input=RunnablePassthrough()
@@ -173,15 +170,14 @@ def get_chains(_retriever):
 # --- UI และ Logic หลัก ---
 st.set_page_config(page_title="เกษตรกรแชตบอท", page_icon="👩‍🌾", layout="wide")
 st.title("👩‍🌾 แชตบอทถาม-ตอบเรื่องการขึ้นทะเบียนเกษตรกร")
-st.write("ขับเคลื่อนโดย Google Gemini และคู่มือทะเบียนเกษตรกรปี 2568 ผลิตโดย เกษตรตำบล_คนใช้แรงงาน")
+st.write("ขับเคลื่อนโดย Meta Llama 3.3 และคู่มือทะเบียนเกษตรกรปี 2568 ผลิตโดย เกษตรตำบล_คนใช้แรงงาน") # [เปลี่ยน] อัปเดตชื่อผู้ขับเคลื่อน
 
 db = load_vector_store()
 
 if db:
-    # สร้าง Retriever ที่ใช้ MMR เพื่อผลการค้นหาที่ดีขึ้น
     retriever = db.as_retriever(
         search_type="mmr",
-        search_kwargs={'k': 7, 'fetch_k': 25} # [ปรับคืนค่าเดิม]
+        search_kwargs={'k': 7, 'fetch_k': 25}
     )
 
     rag_chain_with_history = get_chains(retriever)
@@ -199,12 +195,10 @@ if db:
         with st.chat_message("ai"):
             with st.spinner("กำลังประมวลผล..."):
                 try:
-                    # เรียกใช้ RAG Chain ที่มีระบบจัดการ history ในตัว
                     response_dict = rag_chain_with_history.invoke(
                         {"question": user_input},
                         config={"configurable": {"session_id": "main_session"}}
                     )
-                    # ดึงค่าจาก key 'answer' และ 'context' ที่ได้จาก Chain
                     final_answer = response_dict.get("answer", "ขออภัยครับ เกิดข้อผิดพลาดในการดึงคำตอบ")
                     retrieved_context = response_dict.get("context", "ไม่พบข้อมูลอ้างอิง")
 
@@ -215,12 +209,11 @@ if db:
 
             st.write(final_answer)
             
-            # [เพิ่ม] แสดง Expander พร้อมข้อมูลอ้างอิงที่ใช้
             with st.expander("ดูข้อมูลอ้างอิงที่ AI ใช้ในการตอบคำถามนี้"):
                 if isinstance(retrieved_context, str):
                     st.info(retrieved_context)
                 else:
-                    st.json(retrieved_context) # Fallback to json if not a string
+                    st.json(retrieved_context)
 
         st.session_state.messages.append(AIMessage(content=final_answer))
 

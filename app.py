@@ -179,7 +179,7 @@ if db:
     # สร้าง Retriever ที่ใช้ MMR เพื่อผลการค้นหาที่ดีขึ้น
     retriever = db.as_retriever(
         search_type="mmr",
-        search_kwargs={'k': 7, 'fetch_k': 25} # [ปรับคืนค่าเดิม]
+        search_kwargs={'k': 8, 'fetch_k': 25} # [ปรับคืนค่าเดิม]
     )
 
     rag_chain_with_history = get_chains(retriever)

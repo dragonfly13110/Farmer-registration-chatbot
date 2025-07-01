@@ -26,7 +26,7 @@ if not api_key_pool:
 
 VECTORSTORE_PATH = "vectorstore_smart_chunking_v2" 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-LLM_MODEL = "gemini-2.5-flash-lite-preview-06-17" 
+LLM_MODEL = "gemini-2.5-flash" 
 
 # [เพิ่ม] กำหนดค่าคงที่สำหรับขนาดของ history เพื่อให้ง่ายต่อการปรับแก้
 MAX_HISTORY_MESSAGES = 6
